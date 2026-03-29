@@ -1,0 +1,5 @@
+mosquitto/data/
+mosquitto/log/
+zigbee2mqtt/data/*
+!zigbee2mqtt/data/configuration.yaml
+homeassistant/.storage/
