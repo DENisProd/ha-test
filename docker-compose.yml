@@ -23,9 +23,27 @@ services:
     ports:
       - "8080:8080"
 
-  homeassistant:
-    image: ghcr.io/home-assistant/home-assistant:stable
+  modbus-bridge:
+    container_name: modbus-bridge
+    build: ./modbus-mqtt-bridge
     restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./homeassistant:/config
+    depends_on:
+      - mosquitto
+    # Pass the USB-RS485 adapter into the container.
+    # Adjust /dev/ttyUSB0 if your adapter appears as /dev/ttyUSB1, /dev/ttyACM0, etc.
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    # Add the container user to the 'dialout' group so it can open the serial port.
+    group_add:
+      - dialout
+    environment:
+      SERIAL_PORT:    /dev/ttyUSB0
+      BAUD_RATE:      9600        # change to 19200, 38400 etc. if needed
+      MQTT_HOST:      mosquitto
+      MQTT_PORT:      1883
+      MQTT_CLIENT_ID: modbus-bridge
+      TOPIC_COMMAND:  modbus/command
+      TOPIC_RESPONSE: modbus/response
+      TOPIC_STATUS:   modbus/status
+      TIMEOUT_MS:     1000        # serial read timeout per transaction
+      RUST_LOG:       info

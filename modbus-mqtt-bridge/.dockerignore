@@ -1,0 +1,29 @@
+# Build artifacts
+target/
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env
+.env.local
+
+# Mosquitto runtime state
+mosquitto/data/
+mosquitto/log/
+
+# IDE / editors
+.idea/
+.vscode/
+.claude/
+
+# Docker (avoid recursive context)
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+
+# Docs
+*.md
+README*
