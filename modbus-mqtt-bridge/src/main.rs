@@ -2,7 +2,7 @@ use std::{sync::mpsc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use rmodbus::{client::ModbusRequest, ModbusProto};
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, SubscribeReasonCode};
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
 use tokio::sync::oneshot;
@@ -85,6 +85,18 @@ impl Cmd {
             | Self::WriteSingleCoil      { request_id, .. } => request_id.as_deref(),
         }
     }
+
+    fn action_label(&self) -> &'static str {
+        match self {
+            Self::ReadHoldingRegisters { .. } => "read_holding_registers",
+            Self::ReadInputRegisters { .. } => "read_input_registers",
+            Self::ReadCoils { .. } => "read_coils",
+            Self::ReadDiscreteInputs { .. } => "read_discrete_inputs",
+            Self::WriteSingleRegister { .. } => "write_single_register",
+            Self::WriteMultipleRegisters { .. } => "write_multiple_registers",
+            Self::WriteSingleCoil { .. } => "write_single_coil",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -118,7 +130,22 @@ fn modbus_thread(config: Config, rx: mpsc::Receiver<CmdPacket>) {
     info!("Serial {} @ {} baud", config.serial_port, config.baud_rate);
 
     while let Ok((cmd, tx)) = rx.recv() {
+        let rid = cmd.request_id();
+        tracing::info!(
+            action = %cmd.action_label(),
+            request_id = ?rid,
+            "modbus serial: start",
+        );
         let result = run_cmd(&mut *port, &cmd);
+        match &result {
+            Ok(_) => tracing::info!(action = %cmd.action_label(), request_id = ?rid, "modbus serial: OK"),
+            Err(e) => tracing::warn!(
+                action = %cmd.action_label(),
+                request_id = ?rid,
+                error = %e,
+                "modbus serial: failed",
+            ),
+        }
         let _ = tx.send(result);
     }
 }
@@ -290,8 +317,15 @@ async fn main() -> Result<()> {
     let config = Config::from_env();
 
     info!(
-        "modbus-mqtt-bridge | serial={} baud={} | mqtt={}:{}",
-        config.serial_port, config.baud_rate, config.mqtt_host, config.mqtt_port
+        serial = %config.serial_port,
+        baud = config.baud_rate,
+        mqtt = %format!("{}:{}", config.mqtt_host, config.mqtt_port),
+        mqtt_client_id = %config.mqtt_id,
+        topic_command = %config.topic_cmd,
+        topic_response = %config.topic_rsp,
+        topic_status = %config.topic_status,
+        serial_timeout_ms = config.timeout_ms,
+        "modbus-mqtt-bridge starting (check topics match local-server)",
     );
 
     // Spawn blocking modbus thread
@@ -310,36 +344,82 @@ async fn main() -> Result<()> {
 
     loop {
         match eventloop.poll().await {
-            Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                info!("MQTT connected → subscribing to {}", config.topic_cmd);
+            Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
+                info!(
+                    session_present = ack.session_present,
+                    "MQTT connected → subscribing",
+                );
                 let c = client.clone();
                 let topic   = config.topic_cmd.clone();
                 let t_status = config.topic_status.clone();
                 let serial  = config.serial_port.clone();
                 let baud    = config.baud_rate;
                 tokio::spawn(async move {
-                    c.subscribe(&topic, QoS::AtLeastOnce).await.ok();
+                    match c.subscribe(&topic, QoS::AtLeastOnce).await {
+                        Ok(()) => info!(topic = %topic, "MQTT subscribe sent (wait for SubAck)"),
+                        Err(e) => error!(topic = %topic, error = %e, "MQTT subscribe failed — commands will never arrive"),
+                    }
                     let status = serde_json::json!({
                         "status": "online",
                         "serial_port": serial,
                         "baud_rate": baud,
                     });
-                    c.publish(&t_status, QoS::AtLeastOnce, true,
-                        serde_json::to_vec(&status).unwrap_or_default()).await.ok();
+                    match c
+                        .publish(
+                            &t_status,
+                            QoS::AtLeastOnce,
+                            true,
+                            serde_json::to_vec(&status).unwrap_or_default(),
+                        )
+                        .await
+                    {
+                        Ok(()) => info!(topic = %t_status, "MQTT status published"),
+                        Err(e) => error!(topic = %t_status, error = %e, "MQTT status publish failed"),
+                    }
                 });
             }
 
+            Ok(Event::Incoming(Incoming::SubAck(sa))) => {
+                for (i, code) in sa.return_codes.iter().enumerate() {
+                    match code {
+                        SubscribeReasonCode::Success(qos) => info!(
+                            packet_id = sa.pkid,
+                            filter_index = i,
+                            ?qos,
+                            "MQTT subscribe acknowledged",
+                        ),
+                        SubscribeReasonCode::Failure => warn!(
+                            packet_id = sa.pkid,
+                            filter_index = i,
+                            "MQTT subscribe rejected by broker — command topic will not receive messages",
+                        ),
+                    }
+                }
+            }
+
             Ok(Event::Incoming(Incoming::Publish(p))) => {
+                let topic_in = p.topic;
                 let payload   = p.payload.to_vec();
                 let cmd_tx    = cmd_tx.clone();
                 let c         = client.clone();
                 let t_rsp     = config.topic_rsp.clone();
 
                 tokio::spawn(async move {
+                    info!(
+                        topic = %topic_in,
+                        payload_len = payload.len(),
+                        "MQTT publish received (command)",
+                    );
+
                     let cmd: Cmd = match serde_json::from_slice(&payload) {
                         Ok(v)  => v,
                         Err(e) => {
-                            warn!("Bad command payload: {}", e);
+                            warn!(
+                                topic = %topic_in,
+                                error = %e,
+                                payload_preview = %String::from_utf8_lossy(&payload[..payload.len().min(256)]),
+                                "command JSON parse failed — publishing error response",
+                            );
                             publish_rsp(&c, &t_rsp, Rsp {
                                 success: false, data: None,
                                 error: Some(format!("parse error: {}", e)),
@@ -350,10 +430,20 @@ async fn main() -> Result<()> {
                     };
 
                     let request_id = cmd.request_id().map(String::from);
+                    info!(
+                        action = %cmd.action_label(),
+                        request_id = ?request_id,
+                        topic = %topic_in,
+                        "command accepted, forwarding to Modbus thread",
+                    );
+
                     let (tx, rx)   = oneshot::channel();
 
                     if cmd_tx.send((cmd, tx)).is_err() {
-                        error!("Modbus thread is gone");
+                        error!(
+                            request_id = ?request_id,
+                            "Modbus thread channel closed — cannot execute (bridge serial thread dead?)",
+                        );
                         return;
                     }
 
@@ -372,14 +462,46 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
 
+            Ok(Event::Incoming(other)) => {
+                tracing::debug!(?other, "MQTT incoming (ignored by command handler)");
+            }
+
             _ => {}
         }
     }
 }
 
 async fn publish_rsp(client: &AsyncClient, topic: &str, rsp: Rsp) {
+    let request_id = rsp.request_id.clone();
+    let success = rsp.success;
     match serde_json::to_vec(&rsp) {
-        Ok(payload) => { client.publish(topic, QoS::AtLeastOnce, false, payload).await.ok(); }
-        Err(e)      => error!("Failed to serialize response: {}", e),
+        Ok(payload) => {
+            let len = payload.len();
+            match client.publish(topic, QoS::AtLeastOnce, false, payload).await {
+                Ok(()) => {
+                    info!(
+                        topic = %topic,
+                        request_id = ?request_id,
+                        success,
+                        payload_len = len,
+                        "published Modbus response to MQTT",
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        topic = %topic,
+                        request_id = ?request_id,
+                        success,
+                        error = %e,
+                        "MQTT publish of response failed — local-server will see timeout",
+                    );
+                }
+            }
+        }
+        Err(e) => error!(
+            request_id = ?request_id,
+            error = %e,
+            "failed to serialize Modbus response JSON",
+        ),
     }
 }
