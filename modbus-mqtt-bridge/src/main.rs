@@ -182,6 +182,7 @@ fn modbus_thread(config: Config, rx: mpsc::Receiver<CmdPacket>) {
         let result = match &cmd {
             Cmd::ScanBus { baud_rates, slave_id_start, slave_id_end, .. } => scan_bus(
                 &mut *port,
+                &rx,
                 baud_rates,
                 *slave_id_start,
                 *slave_id_end,
@@ -202,6 +203,31 @@ fn modbus_thread(config: Config, rx: mpsc::Receiver<CmdPacket>) {
     }
 }
 
+/// Process any commands queued during a scan so the bridge stays responsive.
+/// Restores the port to normal baud/timeout before each command, then returns
+/// without restoring scan settings (caller must do that after each call).
+fn service_pending_cmds(
+    port: &mut dyn SerialPort,
+    cmd_rx: &mpsc::Receiver<CmdPacket>,
+    normal_baud: u32,
+    normal_timeout: Duration,
+) {
+    while let Ok((cmd, tx)) = cmd_rx.try_recv() {
+        if matches!(&cmd, Cmd::ScanBus { .. }) {
+            let _ = tx.send(Err(anyhow!("scan already in progress, try again later")));
+            continue;
+        }
+        port.set_baud_rate(normal_baud).ok();
+        port.set_timeout(normal_timeout).ok();
+        port.clear(serialport::ClearBuffer::All).ok();
+
+        let rid = cmd.request_id();
+        tracing::info!(action = %cmd.action_label(), request_id = ?rid, "modbus serial: interleaved during scan");
+        let result = run_cmd(port, &cmd);
+        let _ = tx.send(result);
+    }
+}
+
 // ─── Bus scan ─────────────────────────────────────────────────────────────────
 
 /// Probe each baud_rate × slave_id combination.
@@ -209,6 +235,7 @@ fn modbus_thread(config: Config, rx: mpsc::Receiver<CmdPacket>) {
 /// Restores original baud rate and timeout when done.
 fn scan_bus(
     port: &mut dyn SerialPort,
+    cmd_rx: &mpsc::Receiver<CmdPacket>,
     baud_rates: &[u32],
     slave_id_start: u8,
     slave_id_end: u8,
@@ -234,6 +261,12 @@ fn scan_bus(
         port.set_timeout(SCAN_TIMEOUT).ok();
 
         for slave_id in slave_id_start..=slave_id_end {
+            // Service any commands queued while scanning; after this call the
+            // port may be at restore_baud, so we re-apply scan settings.
+            service_pending_cmds(port, cmd_rx, restore_baud, restore_timeout);
+            port.set_baud_rate(baud).ok();
+            port.set_timeout(SCAN_TIMEOUT).ok();
+
             port.clear(serialport::ClearBuffer::All).ok();
 
             let mut req = ModbusRequest::new(slave_id, ModbusProto::Rtu);
@@ -630,11 +663,12 @@ async fn main() -> Result<()> {
             }
 
             Ok(Event::Incoming(Incoming::Publish(p))) => {
-                let topic_in = p.topic;
-                let payload  = p.payload.to_vec();
-                let cmd_tx   = cmd_tx.clone();
-                let c        = client.clone();
-                let t_rsp    = config.topic_rsp.clone();
+                let topic_in     = p.topic;
+                let payload      = p.payload.to_vec();
+                let cmd_tx       = cmd_tx.clone();
+                let c            = client.clone();
+                let t_rsp        = config.topic_rsp.clone();
+                let t_discovered = config.topic_discovered.clone();
 
                 tokio::spawn(async move {
                     info!(topic = %topic_in, payload_len = payload.len(), "MQTT command received");
@@ -657,6 +691,7 @@ async fn main() -> Result<()> {
                         }
                     };
 
+                    let is_scan    = matches!(cmd, Cmd::ScanBus { .. });
                     let request_id = cmd.request_id().map(String::from);
                     info!(action = %cmd.action_label(), request_id = ?request_id, "command forwarded to Modbus thread");
 
@@ -668,8 +703,21 @@ async fn main() -> Result<()> {
 
                     let result = rx.await.unwrap_or_else(|_| Err(anyhow!("modbus thread dropped")));
                     let rsp = match result {
-                        Ok(data) => Rsp { success: true,  data: Some(data), error: None,                   request_id },
-                        Err(e)   => Rsp { success: false, data: None,       error: Some(e.to_string()),    request_id },
+                        Ok(data) => {
+                            // Publish scan results to modbus/discovered so local-server
+                            // picks them up the same way as the startup scan.
+                            if is_scan {
+                                if let Ok(p) = serde_json::to_vec(&data) {
+                                    if let Err(e) = c.publish(&t_discovered, QoS::AtLeastOnce, true, p).await {
+                                        error!(topic = %t_discovered, error = %e, "scan: publish to discovered failed");
+                                    } else {
+                                        info!(topic = %t_discovered, "scan: result published to discovered");
+                                    }
+                                }
+                            }
+                            Rsp { success: true,  data: Some(data), error: None,                request_id }
+                        }
+                        Err(e) => Rsp { success: false, data: None, error: Some(e.to_string()), request_id },
                     };
                     publish_rsp(&c, &t_rsp, rsp).await;
                 });
