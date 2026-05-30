@@ -281,10 +281,32 @@ fn scan_bus(
 
             // Any 3-byte RTU header (normal or exception) means device is alive.
             let mut header = [0u8; 3];
-            if port.read_exact(&mut header).is_ok() {
-                let is_exception = header[1] & 0x80 != 0;
-                port.clear(serialport::ClearBuffer::Input).ok();
+            let found_via_fc01 = port.read_exact(&mut header).is_ok();
+            port.clear(serialport::ClearBuffer::Input).ok();
 
+            // Fallback: some write-only devices (e.g. cheap relay boards) ignore FC01
+            // but ACK FC05. Send FC05 coil0=OFF as a non-destructive probe.
+            let found = if found_via_fc01 {
+                true
+            } else {
+                port.clear(serialport::ClearBuffer::All).ok();
+                let mut req2 = ModbusRequest::new(slave_id, ModbusProto::Rtu);
+                let mut frame2 = Vec::new();
+                let ok = req2.generate_set_coil(0, false, &mut frame2).is_ok()
+                    && port.write_all(&frame2).is_ok();
+                port.flush().ok();
+                if ok {
+                    let mut h2 = [0u8; 3];
+                    let got = port.read_exact(&mut h2).is_ok() && h2[1] == 0x05;
+                    port.clear(serialport::ClearBuffer::Input).ok();
+                    got
+                } else {
+                    false
+                }
+            };
+
+            if found {
+                let is_exception = found_via_fc01 && (header[1] & 0x80 != 0);
                 // Probe capabilities: which register types the device supports.
                 let caps = probe_capabilities(port, slave_id);
                 tracing::info!(
@@ -303,9 +325,6 @@ fn scan_bus(
                     "holding_registers":  caps.holding_registers,
                     "input_registers":    caps.input_registers,
                 }));
-            } else {
-                // Drain leftover bytes so the next probe is clean.
-                port.clear(serialport::ClearBuffer::Input).ok();
             }
         }
     }
