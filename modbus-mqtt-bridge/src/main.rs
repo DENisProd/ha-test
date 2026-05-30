@@ -114,7 +114,7 @@ enum Cmd {
 
 fn default_scan_baud_rates() -> Vec<u32> { vec![9600, 4800, 19200, 38400] }
 fn default_scan_slave_start() -> u8 { 1 }
-fn default_scan_slave_end() -> u8 { 247 }
+fn default_scan_slave_end() -> u8 { 255 }
 
 impl Cmd {
     fn request_id(&self) -> Option<&str> {
